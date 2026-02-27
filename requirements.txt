@@ -1,0 +1,10 @@
+streamlit>=1.30
+Pillow>=10.0
+numpy>=1.24
+potracer>=0.0.3
+shapely>=2.0
+trimesh[easy]>=4.0
+streamlit-stl>=0.0.1
+lxml>=4.9
+scipy>=1.11
+manifold3d>=2.3

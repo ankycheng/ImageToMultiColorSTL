@@ -82,6 +82,24 @@ if uploaded is not None:
     with st.spinner("Separating colors..."):
         layers = separate_colors(image, config)
 
+    # Background layer selection
+    auto_bg_idx = next((i for i, l in enumerate(layers) if l.is_background), 0)
+    bg_options = {
+        i: layer.hex_color for i, layer in enumerate(layers)
+    }
+    selected_bg = st.radio(
+        "Background layer",
+        options=list(bg_options.keys()),
+        index=auto_bg_idx,
+        format_func=lambda i: bg_options[i],
+        horizontal=True,
+        key="bg_select",
+    )
+
+    # Update is_background flags based on selection
+    for i, layer in enumerate(layers):
+        layer.is_background = (i == selected_bg)
+
     # Display color masks
     mask_cols = st.columns(len(layers))
     for i, (col, layer) in enumerate(zip(mask_cols, layers)):

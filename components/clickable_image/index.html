@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html>
+<head>
+<style>
+  body { margin: 0; overflow: hidden; }
+  canvas { display: block; cursor: crosshair; }
+</style>
+</head>
+<body>
+<canvas id="canvas"></canvas>
+<script src="./streamlit-component-lib.js"></script>
+<script>
+const canvas = document.getElementById("canvas");
+const ctx = canvas.getContext("2d");
+let bgImage = null;
+let radius = 100;
+let displayW = 0, displayH = 0;
+let scaleX = 1, scaleY = 1;
+let mouseX = -1, mouseY = -1;
+let lastFrameHeight = 0;
+let lastB64 = "";
+
+function draw() {
+  if (!bgImage) return;
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.drawImage(bgImage, 0, 0, displayW, displayH);
+
+  if (mouseX >= 0 && mouseY >= 0 && radius > 0) {
+    const displayRadius = radius / scaleX;
+    ctx.beginPath();
+    ctx.arc(mouseX, mouseY, displayRadius, 0, Math.PI * 2);
+    ctx.strokeStyle = "rgba(0, 255, 255, 0.8)";
+    ctx.lineWidth = 2;
+    ctx.setLineDash([6, 4]);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    const cross = 10;
+    ctx.beginPath();
+    ctx.moveTo(mouseX - cross, mouseY);
+    ctx.lineTo(mouseX + cross, mouseY);
+    ctx.moveTo(mouseX, mouseY - cross);
+    ctx.lineTo(mouseX, mouseY + cross);
+    ctx.strokeStyle = "rgba(0, 255, 255, 0.9)";
+    ctx.lineWidth = 1;
+    ctx.stroke();
+  }
+}
+
+canvas.addEventListener("mousemove", (e) => {
+  const rect = canvas.getBoundingClientRect();
+  mouseX = e.clientX - rect.left;
+  mouseY = e.clientY - rect.top;
+  draw();
+});
+
+canvas.addEventListener("mouseleave", () => {
+  mouseX = -1;
+  mouseY = -1;
+  draw();
+});
+
+canvas.addEventListener("click", (e) => {
+  const rect = canvas.getBoundingClientRect();
+  const cx = e.clientX - rect.left;
+  const cy = e.clientY - rect.top;
+  const origX = Math.round(cx * scaleX);
+  const origY = Math.round(cy * scaleY);
+  Streamlit.setComponentValue({
+    x: origX,
+    y: origY,
+    t: Date.now()
+  });
+});
+
+function onRender(event) {
+  const args = event.detail.args;
+  radius = args.radius || 0;
+  const imgW = args.img_w;
+  const imgH = args.img_h;
+  const maxDisplayW = args.max_display_width || 800;
+
+  const aspectRatio = imgH / imgW;
+  displayW = Math.min(imgW, maxDisplayW);
+  displayH = Math.round(displayW * aspectRatio);
+
+  scaleX = imgW / displayW;
+  scaleY = imgH / displayH;
+
+  canvas.width = displayW;
+  canvas.height = displayH;
+
+  // Only update frame height when it actually changes
+  if (displayH !== lastFrameHeight) {
+    lastFrameHeight = displayH;
+    Streamlit.setFrameHeight(displayH);
+  }
+
+  // Only reload image when the data actually changes
+  const b64 = args.image_b64;
+  if (b64 && b64 !== lastB64) {
+    lastB64 = b64;
+    const img = new window.Image();
+    img.onload = () => {
+      bgImage = img;
+      draw();
+    };
+    img.src = "data:image/jpeg;base64," + b64;
+  } else {
+    // Same image, just redraw (e.g. radius changed)
+    draw();
+  }
+}
+
+Streamlit.events.addEventListener(Streamlit.RENDER_EVENT, onRender);
+Streamlit.setComponentReady();
+Streamlit.setFrameHeight(300);
+</script>
+</body>
+</html>

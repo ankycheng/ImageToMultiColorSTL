@@ -68,8 +68,20 @@ def _rgb_to_lab(rgb: np.ndarray) -> np.ndarray:
     return lab
 
 
-def separate_colors(image: Image.Image, config: PipelineConfig) -> list[ColorLayer]:
+def separate_colors(
+    image: Image.Image,
+    config: PipelineConfig,
+    foreground_mask: np.ndarray | None = None,
+) -> list[ColorLayer]:
     """Quantize image colors via KMeans in LAB space and extract per-color masks.
+
+    Args:
+        image: Input image.
+        config: Pipeline configuration.
+        foreground_mask: Optional boolean mask (H, W). If provided, only
+            foreground pixels (True) are used for KMeans clustering and
+            background detection uses area-based fallback instead of
+            border sampling.
 
     Returns a list of ColorLayer sorted by pixel count (largest=background first).
     """
@@ -77,17 +89,30 @@ def separate_colors(image: Image.Image, config: PipelineConfig) -> list[ColorLay
     w, h = img.size
     pixels_rgb = np.array(img).reshape(-1, 3)  # (N, 3) uint8
 
-    # Convert to LAB for perceptually uniform clustering
-    pixels_lab = _rgb_to_lab(pixels_rgb)
+    # If foreground_mask is provided, only cluster foreground pixels
+    if foreground_mask is not None:
+        fg_flat = foreground_mask.reshape(-1)
+        fg_pixels_rgb = pixels_rgb[fg_flat]
+        fg_pixels_lab = _rgb_to_lab(fg_pixels_rgb)
 
-    # KMeans clustering in LAB space
-    # Use minit='++' for better initialization (k-means++)
-    centroids_lab, labels = kmeans2(
-        pixels_lab.astype(np.float32),
-        config.n_colors,
-        minit="++",
-        iter=20,
-    )
+        centroids_lab, fg_labels = kmeans2(
+            fg_pixels_lab.astype(np.float32),
+            config.n_colors,
+            minit="++",
+            iter=20,
+        )
+
+        # Map labels back to the full grid; background pixels get -1
+        labels = np.full(pixels_rgb.shape[0], -1, dtype=np.intp)
+        labels[fg_flat] = fg_labels
+    else:
+        pixels_lab = _rgb_to_lab(pixels_rgb)
+        centroids_lab, labels = kmeans2(
+            pixels_lab.astype(np.float32),
+            config.n_colors,
+            minit="++",
+            iter=20,
+        )
 
     # Map each cluster back to its mean RGB color
     labels_2d = labels.reshape(h, w)
@@ -98,7 +123,7 @@ def separate_colors(image: Image.Image, config: PipelineConfig) -> list[ColorLay
         if not np.any(raw_mask):
             continue
 
-        # Compute mean RGB for this cluster
+        # Compute mean RGB for this cluster (only from foreground pixels)
         cluster_pixels = pixels_rgb[labels == idx]
         mean_rgb = tuple(int(round(v)) for v in cluster_pixels.mean(axis=0))
 
@@ -115,6 +140,10 @@ def separate_colors(image: Image.Image, config: PipelineConfig) -> list[ColorLay
         else:
             cleaned = raw_mask
 
+        # If foreground_mask is provided, ensure no background pixels leak through
+        if foreground_mask is not None:
+            cleaned = cleaned & foreground_mask
+
         pixel_count = int(np.sum(cleaned))
         if pixel_count == 0:
             continue
@@ -129,29 +158,35 @@ def separate_colors(image: Image.Image, config: PipelineConfig) -> list[ColorLay
             )
         )
 
-    # Detect background by border sampling:
-    # The color that dominates the image border is the background.
-    border_width = max(1, min(h, w) // 50)  # ~2% of shortest side
-    border_mask = np.zeros((h, w), dtype=bool)
-    border_mask[:border_width, :] = True   # top
-    border_mask[-border_width:, :] = True  # bottom
-    border_mask[:, :border_width] = True   # left
-    border_mask[:, -border_width:] = True  # right
-
-    bg_idx = -1
-    max_border_ratio = 0.0
-    for i, layer in enumerate(layers):
-        border_overlap = np.sum(layer.mask & border_mask)
-        border_total = np.sum(border_mask)
-        ratio = border_overlap / border_total if border_total > 0 else 0
-        if ratio > max_border_ratio:
-            max_border_ratio = ratio
-            bg_idx = i
-
-    # Fallback: if no color covers > 20% of border, use largest area
-    if max_border_ratio < 0.2:
+    if foreground_mask is not None:
+        # With foreground mask, border sampling is meaningless.
+        # Use largest-area cluster as background.
         layers.sort(key=lambda l: l.pixel_count, reverse=True)
         bg_idx = 0
+    else:
+        # Detect background by border sampling:
+        # The color that dominates the image border is the background.
+        border_width = max(1, min(h, w) // 50)  # ~2% of shortest side
+        border_mask = np.zeros((h, w), dtype=bool)
+        border_mask[:border_width, :] = True   # top
+        border_mask[-border_width:, :] = True  # bottom
+        border_mask[:, :border_width] = True   # left
+        border_mask[:, -border_width:] = True  # right
+
+        bg_idx = -1
+        max_border_ratio = 0.0
+        for i, layer in enumerate(layers):
+            border_overlap = np.sum(layer.mask & border_mask)
+            border_total = np.sum(border_mask)
+            ratio = border_overlap / border_total if border_total > 0 else 0
+            if ratio > max_border_ratio:
+                max_border_ratio = ratio
+                bg_idx = i
+
+        # Fallback: if no color covers > 20% of border, use largest area
+        if max_border_ratio < 0.2:
+            layers.sort(key=lambda l: l.pixel_count, reverse=True)
+            bg_idx = 0
 
     if 0 <= bg_idx < len(layers):
         layers[bg_idx].is_background = True

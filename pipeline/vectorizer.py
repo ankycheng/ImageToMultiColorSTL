@@ -1,18 +1,9 @@
 """Stage 2: Bitmap mask → vector polygons via potrace + Shapely.
 
-Uses the `potrace` (potracer package, import as `potrace`) library.
-
-Potrace tracing behavior on a binary mask:
-- Curve 0 is always the full bitmap boundary (background). It has the largest area.
-- Subsequent curves alternate between "foreground shape" and "hole inside shape".
-- The nesting is: boundary > shape > hole-in-shape > island-in-hole > ...
-- We skip the outermost boundary, then use even/odd nesting depth to classify
-  remaining curves as exteriors (shapes) or holes.
-
-For our use case (each mask = one color's pixels), we:
-1. Skip the bitmap boundary (largest curve).
-2. Next-level curves (negative signed area) are our actual shapes (reversed winding).
-3. Any deeper curves are holes within those shapes.
+Uses potrace for smooth bezier curve tracing, then applies the even-odd
+fill rule (via sequential symmetric_difference) to correctly reconstruct
+foreground polygons with arbitrarily deep nesting (outlines, holes,
+islands-in-holes, etc.).
 """
 
 from dataclasses import dataclass
@@ -72,42 +63,28 @@ def _discretize_curve(curve, n_segments: int) -> list[tuple[float, float]]:
     return points
 
 
-def _signed_area(points: list[tuple[float, float]]) -> float:
-    """Compute signed area using shoelace formula. Positive = CCW."""
+def _ensure_ccw(points: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    """Ensure points are in CCW order (positive signed area)."""
     n = len(points)
     area = 0.0
     for i in range(n):
         x1, y1 = points[i]
         x2, y2 = points[(i + 1) % n]
         area += x1 * y2 - x2 * y1
-    return area / 2.0
-
-
-def _ensure_ccw(points: list[tuple[float, float]]) -> list[tuple[float, float]]:
-    """Ensure points are in CCW order (positive signed area)."""
-    if _signed_area(points) < 0:
+    if area < 0:
         return list(reversed(points))
     return points
 
 
-def _ensure_cw(points: list[tuple[float, float]]) -> list[tuple[float, float]]:
-    """Ensure points are in CW order (negative signed area) for holes."""
-    if _signed_area(points) > 0:
-        return list(reversed(points))
-    return points
-
-
-def _safe_polygon(coords, holes=None) -> Polygon | None:
+def _safe_polygon(coords) -> Polygon | None:
     """Create a valid Shapely Polygon, returning None on failure."""
     try:
-        poly = Polygon(coords, holes)
+        poly = Polygon(coords)
         if not poly.is_valid:
             poly = make_valid(poly)
         if poly.is_empty:
             return None
-        # make_valid can return GeometryCollection or MultiPolygon
         if isinstance(poly, (GeometryCollection, MultiPolygon)):
-            # Extract the largest polygon
             polys = [g for g in poly.geoms if isinstance(g, Polygon) and not g.is_empty]
             if not polys:
                 return None
@@ -117,22 +94,32 @@ def _safe_polygon(coords, holes=None) -> Polygon | None:
         return None
 
 
+def _extract_polygons(geom) -> list[Polygon]:
+    """Extract all Polygon instances from any Shapely geometry."""
+    if geom is None or geom.is_empty:
+        return []
+    if isinstance(geom, Polygon):
+        return [geom]
+    if isinstance(geom, (MultiPolygon, GeometryCollection)):
+        result = []
+        for g in geom.geoms:
+            result.extend(_extract_polygons(g))
+        return result
+    return []
+
+
 def _trace_mask(
     mask: np.ndarray,
     config: PipelineConfig,
     img_height: int,
     mm_per_pixel: float,
 ) -> MultiPolygon | Polygon | None:
-    """Trace a binary mask into Shapely polygons with hole handling.
+    """Trace a binary mask into Shapely polygons.
 
-    Potrace processes a bitmap where True=foreground. It produces curves where:
-    - The first curve (largest positive area) is the bitmap boundary (skip it)
-    - The next curves (negative area) are the actual foreground shapes
-    - Any further nested curves are holes within those shapes, etc.
-
-    We use signed area to classify: after skipping the boundary, negative-area
-    curves become our exteriors (we reverse them to CCW), positive-area curves
-    become holes (reversed to CW).
+    Potrace traces ALL boundaries between foreground (True) and background
+    (False) pixels.  We apply the even-odd fill rule via sequential
+    symmetric_difference of every boundary polygon to reconstruct the
+    correct foreground geometry — no heuristics needed.
     """
     bmp = potrace.Bitmap(mask.astype(np.bool_))
     path = bmp.trace(
@@ -143,99 +130,74 @@ def _trace_mask(
     if not path.curves:
         return None
 
-    # Discretize all curves with their signed areas
-    image_area = mask.shape[0] * mask.shape[1]
-    curve_data = []  # list of (signed_area, points_px)
-
+    # Discretize all curves into polygons (in mm coordinates)
+    all_polys = []
     for curve in path.curves:
-        pts = _discretize_curve(curve, config.bezier_segments)
-        if len(pts) < 3:
+        pts_px = _discretize_curve(curve, config.bezier_segments)
+        if len(pts_px) < 3:
             continue
-        sa = _signed_area(pts)
-        curve_data.append((sa, pts))
-
-    if not curve_data:
-        return None
-
-    # Sort by |area| descending to identify the boundary
-    curve_data.sort(key=lambda x: abs(x[0]), reverse=True)
-
-    # The largest curve is the bitmap boundary — skip it if it's > 30% of image area
-    # (generous threshold to handle partial masks that don't span the full image)
-    boundary_area = abs(curve_data[0][0])
-    start_idx = 1 if boundary_area > image_area * 0.3 else 0
-
-    if start_idx >= len(curve_data):
-        return None
-
-    # Remaining curves: classify as exterior (our shapes) or hole
-    # After removing the boundary, negative-area curves are foreground shapes,
-    # positive-area curves are holes in those shapes.
-    exteriors = []  # points in mm
-    holes = []  # points in mm
-
-    for sa, pts in curve_data[start_idx:]:
-        # Transform: flip Y and scale to mm
         pts_mm = [
-            (x * mm_per_pixel, (img_height - y) * mm_per_pixel) for x, y in pts
+            (x * mm_per_pixel, (img_height - y) * mm_per_pixel)
+            for x, y in pts_px
         ]
+        pts_mm = _ensure_ccw(pts_mm)
+        poly = _safe_polygon(pts_mm)
+        if poly is not None and poly.area > 0.001:
+            all_polys.append(poly)
 
-        if sa < 0:
-            # Negative area in image coords → this is a foreground shape
-            # Reverse to CCW for Shapely exterior
-            exteriors.append(_ensure_ccw(pts_mm))
-        else:
-            # Positive area → hole within a shape
-            # Reverse to CW for Shapely hole
-            holes.append(_ensure_cw(pts_mm))
-
-    if not exteriors:
+    if not all_polys:
         return None
 
-    # Build polygons: match holes to their containing exterior
-    # Sort exteriors by area descending (largest first, more likely to contain holes)
-    ext_with_area = [(Polygon(e).area, e) for e in exteriors]
-    ext_with_area.sort(key=lambda x: x[0], reverse=True)
+    h, w = mask.shape
+    w_mm = w * mm_per_pixel
+    h_mm = h * mm_per_pixel
 
-    polygons = []
-    unmatched_holes = list(holes)
+    # Potrace ALWAYS emits curve 0 as the bitmap boundary (bbox = full
+    # image: 0,0 → w,h).  This is NOT part of the actual foreground, so
+    # skip it before applying the even-odd fill rule.
+    first = all_polys[0]
+    bounds = first.bounds  # (minx, miny, maxx, maxy) in mm
+    eps = mm_per_pixel * 2  # tolerance
+    is_bitmap_boundary = (
+        bounds[0] < eps
+        and bounds[1] < eps
+        and bounds[2] > w_mm - eps
+        and bounds[3] > h_mm - eps
+    )
+    if is_bitmap_boundary:
+        all_polys = all_polys[1:]
 
-    for _, ext_coords in ext_with_area:
-        ext_poly = _safe_polygon(ext_coords)
-        if ext_poly is None:
+    if not all_polys:
+        return None
+
+    # Apply even-odd fill rule via symmetric_difference.
+    # Each boundary curve toggles foreground/background state, so XOR-ing
+    # all of them correctly handles any nesting depth:
+    #   ring = exterior XOR hole
+    #   ring-with-island = exterior XOR hole XOR island
+    result = all_polys[0]
+    for poly in all_polys[1:]:
+        try:
+            result = result.symmetric_difference(poly)
+        except Exception:
             continue
 
-        # Find holes that belong to this exterior
-        matched = []
-        still_unmatched = []
-        for hole_coords in unmatched_holes:
-            hole_poly = _safe_polygon(hole_coords)
-            if hole_poly and ext_poly.contains(hole_poly.representative_point()):
-                matched.append(hole_coords)
-            else:
-                still_unmatched.append(hole_coords)
-        unmatched_holes = still_unmatched
-
-        if matched:
-            poly = _safe_polygon(ext_coords, matched)
-        else:
-            poly = ext_poly
-
-        if poly is not None:
-            # Simplify if configured
-            if config.simplify_tolerance > 0:
-                simplified = poly.simplify(
-                    config.simplify_tolerance * mm_per_pixel,
-                    preserve_topology=True,
-                )
-                if not simplified.is_empty:
-                    poly = simplified
-            polygons.append(poly)
-
-    if not polygons:
+    # Keep only polygon geometries (drop stray lines/points from XOR)
+    polys = _extract_polygons(result)
+    if not polys:
         return None
 
-    result = unary_union(polygons)
+    result = unary_union(polys)
+
+    # Simplify if configured
+    if config.simplify_tolerance > 0:
+        simplified = result.simplify(
+            config.simplify_tolerance * mm_per_pixel,
+            preserve_topology=True,
+        )
+        if not simplified.is_empty:
+            result = simplified
+
     if result.is_empty:
         return None
     return result
@@ -245,23 +207,37 @@ def vectorize_layers(
     layers: list,  # list[ColorLayer]
     image_size: tuple[int, int],  # (width, height)
     config: PipelineConfig,
+    trace_background: bool = False,
 ) -> list[VectorizedLayer]:
-    """Vectorize all color layers into Shapely polygons."""
+    """Vectorize all color layers into Shapely polygons.
+
+    Args:
+        trace_background: If True, trace the background mask shape (for
+            preserving rounded corners etc. when a foreground mask is active).
+            If False, use a simple rectangle as the base plate.
+    """
     img_w, img_h = image_size
     mm_per_pixel = config.target_width_mm / img_w
 
     results = []
     for layer in layers:
         if layer.is_background:
-            # Background is a simple rectangle
-            w_mm = img_w * mm_per_pixel
-            h_mm = img_h * mm_per_pixel
-            rect = Polygon([(0, 0), (w_mm, 0), (w_mm, h_mm), (0, h_mm)])
+            bg_poly = None
+
+            if trace_background:
+                bg_poly = _trace_mask(layer.mask, config, img_h, mm_per_pixel)
+
+            if bg_poly is None:
+                # Full rectangle as base plate
+                w_mm = img_w * mm_per_pixel
+                h_mm = img_h * mm_per_pixel
+                bg_poly = Polygon([(0, 0), (w_mm, 0), (w_mm, h_mm), (0, h_mm)])
+
             results.append(
                 VectorizedLayer(
                     color=layer.color,
                     hex_color=layer.hex_color,
-                    polygon=rect,
+                    polygon=bg_poly,
                     component_polygons=None,
                     is_background=True,
                 )

@@ -7,6 +7,9 @@ __pycache__/
 # Output files
 output/
 
+# Large media
+video/
+
 # OS
 .DS_Store
 

@@ -30,8 +30,10 @@ class PipelineConfig:
     # Polygon simplification (Shapely)
     simplify_tolerance: float = 0.5  # pixels; 0 = no simplification
 
-    # Mesh validation
-    require_watertight: bool = True
+    # Flat mode (all layers same height, no protrusion)
+    flat_mode: bool = False
+    flat_base_color: tuple[int, int, int] | None = None  # None = no base plate
+    flat_base_height_mm: float = 0.4
 
     def get_component_height(self, color_idx: int, comp_idx: int) -> float:
         """Get height for a specific component, with fallback chain."""

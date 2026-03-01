@@ -9,7 +9,7 @@ from dataclasses import dataclass
 
 import numpy as np
 import trimesh
-from shapely.geometry import MultiPolygon, Polygon
+from shapely.geometry import MultiPolygon, Polygon, box as shapely_box
 
 from .config import PipelineConfig
 
@@ -51,7 +51,7 @@ def _extrude_polygon(
             mesh = trimesh.creation.extrude_polygon(geom, height)
             if mesh is not None and len(mesh.faces) > 0:
                 meshes.append(mesh)
-        except Exception:
+        except (ValueError, RuntimeError, IndexError, TypeError):
             continue
 
     if not meshes:
@@ -73,15 +73,93 @@ def _set_face_color(mesh: trimesh.Trimesh, color: tuple[int, int, int]) -> None:
     ).astype(np.uint8)
 
 
+def _bounding_box_polygon(vector_layers: list) -> Polygon | None:
+    """Compute bounding box polygon from all vector layers (in mm coords).
+
+    Returns None if no valid polygons exist.
+    """
+    min_x = min_y = float("inf")
+    max_x = max_y = float("-inf")
+    for vl in vector_layers:
+        if vl.polygon is None or vl.polygon.is_empty:
+            continue
+        bx0, by0, bx1, by1 = vl.polygon.bounds
+        min_x, min_y = min(min_x, bx0), min(min_y, by0)
+        max_x, max_y = max(max_x, bx1), max(max_y, by1)
+    if min_x == float("inf"):
+        return None
+    return shapely_box(min_x, min_y, max_x, max_y)
+
+
 def extrude_layers(
     vector_layers: list,  # list[VectorizedLayer]
     config: PipelineConfig,
 ) -> list[MeshLayer]:
     """Extrude all vectorized layers into 3D meshes.
 
-    Default: one mesh per color (all components merged).
-    If per_component mode: one mesh per connected component.
+    Flat mode: all layers at uniform height, optional base plate underneath.
+    Relief mode (default): background base + raised foreground layers.
     """
+    if config.flat_mode:
+        return _extrude_flat(vector_layers, config)
+    return _extrude_relief(vector_layers, config)
+
+
+def _extrude_flat(
+    vector_layers: list,
+    config: PipelineConfig,
+) -> list[MeshLayer]:
+    """Flat mode: all color tiles at same height, optional base plate."""
+    mesh_layers = []
+    tile_height = config.base_height_mm
+    z_offset = config.flat_base_height_mm if config.flat_base_color else 0.0
+
+    # Optional base plate
+    if config.flat_base_color is not None:
+        base_poly = _bounding_box_polygon(vector_layers)
+        if base_poly is None:
+            return mesh_layers
+        base_mesh = _extrude_polygon(base_poly, config.flat_base_height_mm)
+        if base_mesh is not None:
+            _set_face_color(base_mesh, config.flat_base_color)
+            hex_color = "#{:02X}{:02X}{:02X}".format(*config.flat_base_color)
+            mesh_layers.append(
+                MeshLayer(
+                    mesh=base_mesh,
+                    color=config.flat_base_color,
+                    hex_color=hex_color,
+                    name=f"{hex_color}_base",
+                    is_background=True,
+                    height_mm=config.flat_base_height_mm,
+                )
+            )
+
+    # All color layers at uniform height
+    for vlayer in vector_layers:
+        if vlayer.polygon is None or vlayer.polygon.is_empty:
+            continue
+        mesh = _extrude_polygon(vlayer.polygon, tile_height, z_offset=z_offset)
+        if mesh is not None:
+            _set_face_color(mesh, vlayer.color)
+            mesh_layers.append(
+                MeshLayer(
+                    mesh=mesh,
+                    color=vlayer.color,
+                    hex_color=vlayer.hex_color,
+                    name=f"{vlayer.hex_color}_tile",
+                    is_background=False,
+                    height_mm=tile_height,
+                )
+            )
+
+    return mesh_layers
+
+
+def _extrude_relief(
+    vector_layers: list,
+    config: PipelineConfig,
+) -> list[MeshLayer]:
+    """Relief mode (original): base plate + raised foreground layers."""
     mesh_layers = []
     per_component = bool(config.component_heights)
 
@@ -103,7 +181,6 @@ def extrude_layers(
             continue
 
         if per_component and vlayer.component_polygons:
-            # Per-component mode: individual meshes
             for comp_idx, comp_poly in enumerate(vlayer.component_polygons):
                 if comp_poly is None:
                     continue
@@ -124,7 +201,6 @@ def extrude_layers(
                         )
                     )
         elif vlayer.polygon is not None:
-            # Merged mode: one mesh per color
             height = config.get_component_height(color_idx, 0)
             mesh = _extrude_polygon(
                 vlayer.polygon, height, z_offset=config.base_height_mm

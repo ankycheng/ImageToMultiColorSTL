@@ -1,0 +1,71 @@
+<div id="viewer" style="width:100%;height:500px;background:#1e1e1e;border-radius:8px;"></div>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+const container = document.getElementById('viewer');
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(45, container.clientWidth / container.clientHeight, 0.1, 2000);
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(container.clientWidth, container.clientHeight);
+renderer.setPixelRatio(window.devicePixelRatio);
+container.appendChild(renderer.domElement);
+
+scene.add(new THREE.AmbientLight(0xffffff, 1.2));
+const dirLight1 = new THREE.DirectionalLight(0xffffff, 1.0);
+dirLight1.position.set(5, 10, 7);
+scene.add(dirLight1);
+const dirLight2 = new THREE.DirectionalLight(0xffffff, 0.6);
+dirLight2.position.set(-5, 5, -3);
+scene.add(dirLight2);
+const dirLight3 = new THREE.DirectionalLight(0xffffff, 0.4);
+dirLight3.position.set(0, -5, 5);
+scene.add(dirLight3);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+
+const glbBase64 = "__GLB_B64__";
+const binary = atob(glbBase64);
+const bytes = new Uint8Array(binary.length);
+for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+
+const loader = new GLTFLoader();
+loader.parse(bytes.buffer, '', function(gltf) {
+    const model = gltf.scene;
+    model.traverse(function(child) {
+        if (child.isMesh && child.material) {
+            child.material.roughness = 0.85;
+            child.material.metalness = 0.0;
+        }
+    });
+    scene.add(model);
+
+    const box = new THREE.Box3().setFromObject(model);
+    const center = box.getCenter(new THREE.Vector3());
+    const size = box.getSize(new THREE.Vector3());
+    model.position.sub(center);
+
+    const maxDim = Math.max(size.x, size.y, size.z);
+    camera.position.set(maxDim * 0.8, maxDim * 1.0, maxDim * 1.2);
+    camera.lookAt(0, 0, 0);
+    controls.target.set(0, 0, 0);
+    controls.update();
+});
+
+function animate() {
+    requestAnimationFrame(animate);
+    controls.update();
+    renderer.render(scene, camera);
+}
+animate();
+</script>

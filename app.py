@@ -52,8 +52,24 @@ st.caption("Upload a PNG image → auto color separation → vectorize → extru
 st.sidebar.header("Parameters")
 n_colors = st.sidebar.slider("Number of colors", 2, 8, 3)
 target_width = st.sidebar.number_input("Target width (mm)", 10.0, 500.0, 100.0, step=5.0)
-base_height = st.sidebar.number_input("Base plate height (mm)", 0.4, 10.0, 1.6, step=0.2)
-default_detail = st.sidebar.number_input("Default detail height (mm)", 0.2, 5.0, 0.4, step=0.1)
+
+flat_mode = st.sidebar.checkbox("Flat mode (no protrusion)", key="flat_mode")
+
+if flat_mode:
+    tile_height = st.sidebar.number_input("Tile height (mm)", 0.4, 10.0, 2.0, step=0.2)
+    add_base = st.sidebar.checkbox("Add base plate", value=False, key="flat_add_base")
+    flat_base_height = 0.4
+    if add_base:
+        flat_base_height = st.sidebar.number_input(
+            "Base plate height (mm)", 0.2, 5.0, 0.4, step=0.1, key="flat_base_h"
+        )
+    base_height = tile_height
+    default_detail = tile_height
+else:
+    add_base = False
+    flat_base_height = 0.4
+    base_height = st.sidebar.number_input("Base plate height (mm)", 0.4, 10.0, 1.6, step=0.2)
+    default_detail = st.sidebar.number_input("Default detail height (mm)", 0.2, 5.0, 0.4, step=0.1)
 
 st.sidebar.subheader("Advanced")
 morph_iter = st.sidebar.slider("Morphological cleanup iterations", 0, 5, 2)
@@ -268,6 +284,8 @@ if uploaded is not None:
         morph_iterations=morph_iter,
         potrace_turdsize=turdsize,
         simplify_tolerance=simplify,
+        flat_mode=flat_mode,
+        flat_base_height_mm=flat_base_height,
     )
 
     with st.spinner("Separating colors..."):
@@ -314,56 +332,79 @@ if uploaded is not None:
 
     color_heights: dict[int, float] = {}
     component_heights: dict[tuple[int, int], float] = {}
+    flat_base_color: tuple[int, int, int] | None = None
 
-    height_cols = st.columns(len(layers))
-    for i, (col, layer) in enumerate(zip(height_cols, layers)):
-        with col:
-            if layer.is_background:
-                st.write(f"**Base plate**: {base_height} mm")
-            else:
-                h = st.number_input(
-                    f"Height for {layer.hex_color}",
-                    0.1, 5.0, default_detail, step=0.1,
-                    key=f"height_{i}",
+    if flat_mode:
+        st.info(f"Flat mode: all layers at {base_height} mm")
+        if add_base:
+            color_options = [layer.hex_color for layer in layers]
+            base_color_choice = st.radio(
+                "Base plate color",
+                color_options + ["Custom"],
+                horizontal=True,
+                key="flat_base_color_choice",
+            )
+            if base_color_choice == "Custom":
+                base_color_hex = st.color_picker("Pick base color", "#FFFFFF", key="flat_base_custom")
+                flat_base_color = (
+                    int(base_color_hex[1:3], 16),
+                    int(base_color_hex[3:5], 16),
+                    int(base_color_hex[5:7], 16),
                 )
-                color_heights[i] = h
-
-    # Advanced: per-component overrides
-    show_components = st.checkbox("Show per-component height overrides")
-    if show_components:
-        for i, layer in enumerate(layers):
-            if layer.is_background or not layer.components:
-                continue
-            st.markdown(f"**Components for {layer.hex_color}:**")
-            comp_cols = st.columns(min(len(layer.components), 4))
-            for j, comp_mask in enumerate(layer.components):
-                col_idx = j % len(comp_cols)
-                with comp_cols[col_idx]:
-                    # Show component mask on checkerboard
-                    comp_img = _mask_preview(comp_mask, layer.color)
-                    st.image(comp_img, use_container_width=True, caption=f"Part {j}")
-                    ch = st.number_input(
-                        f"Height (mm)",
-                        0.1, 5.0,
-                        color_heights.get(i, default_detail),
-                        step=0.1,
-                        key=f"comp_{i}_{j}",
+            else:
+                matched = next(l for l in layers if l.hex_color == base_color_choice)
+                flat_base_color = matched.color
+    else:
+        height_cols = st.columns(len(layers))
+        for i, (col, layer) in enumerate(zip(height_cols, layers)):
+            with col:
+                if layer.is_background:
+                    st.write(f"**Base plate**: {base_height} mm")
+                else:
+                    h = st.number_input(
+                        f"Height for {layer.hex_color}",
+                        0.1, 5.0, default_detail, step=0.1,
+                        key=f"height_{i}",
                     )
-                    component_heights[(i, j)] = ch
+                    color_heights[i] = h
+
+        # Advanced: per-component overrides
+        show_components = st.checkbox("Show per-component height overrides")
+        if show_components:
+            for i, layer in enumerate(layers):
+                if layer.is_background or not layer.components:
+                    continue
+                st.markdown(f"**Components for {layer.hex_color}:**")
+                comp_cols = st.columns(min(len(layer.components), 4))
+                for j, comp_mask in enumerate(layer.components):
+                    col_idx = j % len(comp_cols)
+                    with comp_cols[col_idx]:
+                        comp_img = _mask_preview(comp_mask, layer.color)
+                        st.image(comp_img, use_container_width=True, caption=f"Part {j}")
+                        ch = st.number_input(
+                            f"Height (mm)",
+                            0.1, 5.0,
+                            color_heights.get(i, default_detail),
+                            step=0.1,
+                            key=f"comp_{i}_{j}",
+                        )
+                        component_heights[(i, j)] = ch
 
     # Update config with height settings
     config.color_heights = color_heights
     config.component_heights = component_heights
+    config.flat_base_color = flat_base_color
 
     # --- Step 3: Generate 3D ---
     st.subheader("Step 3: Generate 3D Model")
 
     if st.button("Generate STL / 3MF", type="primary"):
-        # Vectorize
+        # Vectorize — flat mode needs all layers traced (including background)
+        trace_bg = flat_mode or foreground_mask is not None
         with st.spinner("Vectorizing (potrace)..."):
             vector_layers = vectorize_layers(
                 layers, image.size, config,
-                trace_background=foreground_mask is not None,
+                trace_background=trace_bg,
             )
 
         # Extrude
@@ -394,80 +435,8 @@ if uploaded is not None:
             glb_data = combined.export(file_type="glb")
             glb_b64 = base64.b64encode(glb_data).decode()
 
-            threejs_html = f"""
-            <div id="viewer" style="width:100%;height:500px;background:#1e1e1e;border-radius:8px;"></div>
-            <script type="importmap">
-            {{
-              "imports": {{
-                "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
-                "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
-              }}
-            }}
-            </script>
-            <script type="module">
-            import * as THREE from 'three';
-            import {{ GLTFLoader }} from 'three/addons/loaders/GLTFLoader.js';
-            import {{ OrbitControls }} from 'three/addons/controls/OrbitControls.js';
-
-            const container = document.getElementById('viewer');
-            const scene = new THREE.Scene();
-            const camera = new THREE.PerspectiveCamera(45, container.clientWidth / container.clientHeight, 0.1, 2000);
-            const renderer = new THREE.WebGLRenderer({{ antialias: true }});
-            renderer.setSize(container.clientWidth, container.clientHeight);
-            renderer.setPixelRatio(window.devicePixelRatio);
-            container.appendChild(renderer.domElement);
-
-            scene.add(new THREE.AmbientLight(0xffffff, 1.2));
-            const dirLight1 = new THREE.DirectionalLight(0xffffff, 1.0);
-            dirLight1.position.set(5, 10, 7);
-            scene.add(dirLight1);
-            const dirLight2 = new THREE.DirectionalLight(0xffffff, 0.6);
-            dirLight2.position.set(-5, 5, -3);
-            scene.add(dirLight2);
-            const dirLight3 = new THREE.DirectionalLight(0xffffff, 0.4);
-            dirLight3.position.set(0, -5, 5);
-            scene.add(dirLight3);
-
-            const controls = new OrbitControls(camera, renderer.domElement);
-            controls.enableDamping = true;
-
-            const glbBase64 = "{glb_b64}";
-            const binary = atob(glbBase64);
-            const bytes = new Uint8Array(binary.length);
-            for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-
-            const loader = new GLTFLoader();
-            loader.parse(bytes.buffer, '', function(gltf) {{
-                const model = gltf.scene;
-                // Matte PLA-like finish: high roughness, no metalness
-                model.traverse(function(child) {{
-                    if (child.isMesh && child.material) {{
-                        child.material.roughness = 0.85;
-                        child.material.metalness = 0.0;
-                    }}
-                }});
-                scene.add(model);
-
-                const box = new THREE.Box3().setFromObject(model);
-                const center = box.getCenter(new THREE.Vector3());
-                const size = box.getSize(new THREE.Vector3());
-                model.position.sub(center);
-
-                const maxDim = Math.max(size.x, size.y, size.z);
-                camera.position.set(maxDim * 0.8, maxDim * 1.0, maxDim * 1.2);
-                camera.lookAt(0, 0, 0);
-                controls.target.set(0, 0, 0);
-                controls.update();
-            }});
-
-            function animate() {{
-                requestAnimationFrame(animate);
-                controls.update();
-                renderer.render(scene, camera);
-            }}
-            animate();
-            </script>
-            """
+            _viewer_template = Path(__file__).parent / "components" / "viewer_3d.html"
+            threejs_html = _viewer_template.read_text().replace("__GLB_B64__", glb_b64)
             components.html(threejs_html, height=520)
         except Exception as e:
             st.warning(f"3D preview unavailable: {e}")

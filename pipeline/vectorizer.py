@@ -152,35 +152,41 @@ def _trace_mask(
     w_mm = w * mm_per_pixel
     h_mm = h * mm_per_pixel
 
-    # Potrace ALWAYS emits curve 0 as the bitmap boundary (bbox = full
-    # image: 0,0 → w,h).  This is NOT part of the actual foreground, so
-    # skip it before applying the even-odd fill rule.
-    first = all_polys[0]
-    bounds = first.bounds  # (minx, miny, maxx, maxy) in mm
-    eps = mm_per_pixel * 2  # tolerance
-    is_bitmap_boundary = (
-        bounds[0] < eps
-        and bounds[1] < eps
-        and bounds[2] > w_mm - eps
-        and bounds[3] > h_mm - eps
+    # Potrace behaviour depends on whether foreground touches image edges:
+    #
+    # A) Foreground does NOT touch edges:
+    #    Potrace emits curve 0 = bitmap boundary (full-image rectangle),
+    #    then foreground boundaries.  Remove curve 0, XOR the rest.
+    #
+    # B) Foreground DOES touch edges:
+    #    Potrace does NOT emit a bitmap boundary.  Instead it emits only
+    #    the internal boundaries (background gaps / holes).  XOR-ing from
+    #    nothing gives the background, not the foreground.
+    #    Fix: start XOR from a full-image rectangle to invert the sense.
+    touches_edge = (
+        np.any(mask[0, :])
+        or np.any(mask[-1, :])
+        or np.any(mask[:, 0])
+        or np.any(mask[:, -1])
     )
-    if is_bitmap_boundary:
-        all_polys = all_polys[1:]
 
-    if not all_polys:
-        return None
-
-    # Apply even-odd fill rule via symmetric_difference.
-    # Each boundary curve toggles foreground/background state, so XOR-ing
-    # all of them correctly handles any nesting depth:
-    #   ring = exterior XOR hole
-    #   ring-with-island = exterior XOR hole XOR island
-    result = all_polys[0]
-    for poly in all_polys[1:]:
-        try:
-            result = result.symmetric_difference(poly)
-        except Exception:
-            continue
+    if touches_edge:
+        # No bitmap boundary emitted — start from full image rectangle
+        result = Polygon([(0, 0), (w_mm, 0), (w_mm, h_mm), (0, h_mm)])
+        for poly in all_polys:
+            try:
+                result = result.symmetric_difference(poly)
+            except Exception:
+                continue
+    else:
+        # Bitmap boundary emitted as curve 0 — skip it, XOR the rest
+        curves_to_xor = all_polys[1:] if len(all_polys) > 1 else all_polys
+        result = curves_to_xor[0]
+        for poly in curves_to_xor[1:]:
+            try:
+                result = result.symmetric_difference(poly)
+            except Exception:
+                continue
 
     # Keep only polygon geometries (drop stray lines/points from XOR)
     polys = _extract_polygons(result)
